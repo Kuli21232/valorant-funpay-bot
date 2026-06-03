@@ -2,6 +2,9 @@
 *.db
 *.lock
 funpay_debug.html
+*_debug.html
+*_debug.json
+riot_logout_endpoint.json
 riot_sessions/
 riot_debug/
 riot_profiles/
