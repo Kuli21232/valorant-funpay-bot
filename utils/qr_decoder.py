@@ -9,6 +9,8 @@ QR data format for Riot Valorant client (observed):
   https://valorant.riotgames.com/...?token=...
   Various URL-shaped payloads — we don't parse, we return raw text to the
   mobile module which knows what to do.
+
+Uses opencv-python (cv2) for decoding — no external DLLs required on Windows.
 """
 from __future__ import annotations
 
@@ -17,21 +19,22 @@ import logging
 from pathlib import Path
 from typing import Optional, Union
 
+import cv2
+import numpy as np
 from PIL import Image
-from pyzbar import pyzbar
 
 logger = logging.getLogger(__name__)
+
+_detector = cv2.QRCodeDetector()
 
 
 def decode_qr_from_bytes(data: bytes) -> Optional[str]:
     """Decode the first QR-code found in raw image bytes.
-    Returns the QR payload as a string, or None if no QR is found / image
-    is unreadable."""
+    Returns the QR payload as a string, or None if no QR is found."""
     if not data:
         return None
     try:
         img = Image.open(io.BytesIO(data))
-        # Convert palette/RGBA images to RGB for pyzbar
         if img.mode not in ("L", "RGB"):
             img = img.convert("RGB")
     except Exception as e:
@@ -53,8 +56,7 @@ def decode_qr_from_file(path: Union[str, Path]) -> Optional[str]:
 
 
 def decode_all_from_bytes(data: bytes) -> list[str]:
-    """Return ALL QR codes found in the image (useful for screenshots
-    that contain multiple codes / surrounding UI)."""
+    """Return ALL QR codes found in the image."""
     if not data:
         return []
     try:
@@ -64,12 +66,15 @@ def decode_all_from_bytes(data: bytes) -> list[str]:
     return _decode_all(img)
 
 
+def _pil_to_cv2(img: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
 def _decode(img: Image.Image) -> Optional[str]:
-    """First pass on the image; if nothing, try upscaling (QR can be tiny)."""
+    """First pass; if nothing found, retry on 2x upscaled image."""
     res = _decode_all(img)
     if res:
         return res[0]
-    # Retry on upscaled image — buyer screenshots are often small.
     try:
         w, h = img.size
         up = img.resize((w * 2, h * 2), Image.LANCZOS)
@@ -82,12 +87,12 @@ def _decode(img: Image.Image) -> Optional[str]:
 
 
 def _decode_all(img: Image.Image) -> list[str]:
-    found = pyzbar.decode(img)
+    mat = _pil_to_cv2(img)
+    retval, decoded_list, _, straight_list = _detector.detectAndDecodeMulti(mat)
+    if not retval:
+        return []
     out: list[str] = []
-    for d in found:
-        if d.type == "QRCODE":
-            try:
-                out.append(d.data.decode("utf-8", errors="replace"))
-            except Exception:
-                continue
+    for text in decoded_list:
+        if text:
+            out.append(text)
     return out
