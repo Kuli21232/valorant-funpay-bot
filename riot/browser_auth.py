@@ -400,7 +400,15 @@ class BrowserAuth:
         logger.info("[browser] on login form: %s", page.url[:120])
 
     async def _extract_captcha_params(self, page) -> tuple[Optional[str], Optional[str]]:
-        """Pull (sitekey, rqdata) from the live DOM."""
+        """Pull (sitekey, rqdata) from the live DOM.
+        Convenience wrapper around _extract_captcha_full that returns just
+        the two essential fields."""
+        info = await self._extract_captcha_full(page)
+        return info.get("sitekey"), info.get("rqdata")
+
+    async def _extract_captcha_full(self, page) -> dict:
+        """Pull sitekey, rqdata AND visible/invisible info from the DOM.
+        Returns {'sitekey': str|None, 'rqdata': str|None, 'invisible': bool}."""
         try:
             result = await page.evaluate("""() => {
                 const el = document.querySelector('[data-sitekey]') ||
@@ -408,11 +416,27 @@ class BrowserAuth:
                            document.querySelector('iframe[src*="hcaptcha"]');
                 let sitekey = el ? el.getAttribute('data-sitekey') : null;
                 let rqdata = el ? el.getAttribute('data-rqdata') : null;
+                let size = el ? el.getAttribute('data-size') : null;
                 if (!rqdata && window.hcaptcha && window.hcaptcha.getConfig) {
                     try {
                         const cfg = window.hcaptcha.getConfig();
-                        if (cfg) { rqdata = rqdata || cfg.rqdata; sitekey = sitekey || cfg.sitekey; }
+                        if (cfg) {
+                            rqdata = rqdata || cfg.rqdata;
+                            sitekey = sitekey || cfg.sitekey;
+                            size = size || cfg.size;
+                        }
                     } catch (e) {}
+                }
+                // Look at the actual challenge iframe — if it's visible
+                // and has non-trivial size, this is a visible challenge.
+                let visibleChallenge = false;
+                const challengeIfr = document.querySelector(
+                    'iframe[src*="hcaptcha"][src*="frame=challenge"], ' +
+                    'iframe[title*="challenge"]'
+                );
+                if (challengeIfr) {
+                    const r = challengeIfr.getBoundingClientRect();
+                    if (r.width > 100 && r.height > 100) visibleChallenge = true;
                 }
                 if (!sitekey) {
                     const ifr = document.querySelector('iframe[src*="hcaptcha"]');
@@ -421,12 +445,21 @@ class BrowserAuth:
                         if (m) sitekey = m[1];
                     }
                 }
-                return {sitekey, rqdata};
+                // size="invisible" → invisible. Otherwise default to visible
+                // unless we detect a visible challenge iframe.
+                const invisible = (size === "invisible") && !visibleChallenge;
+                return {sitekey, rqdata, invisible, size};
             }""")
-            return result.get("sitekey"), result.get("rqdata")
+            logger.info("[browser] captcha params: sitekey=%s, "
+                        "rqdata=%s, invisible=%s, size=%s",
+                        result.get("sitekey"),
+                        "yes" if result.get("rqdata") else "no",
+                        result.get("invisible"),
+                        result.get("size"))
+            return result or {}
         except Exception as e:
             logger.warning("[browser] captcha param extraction failed: %s", e)
-            return None, None
+            return {}
 
     async def _inject_captcha_token(self, page, token: str) -> None:
         """Inject the solved hCaptcha token into the page so submit succeeds."""
@@ -456,36 +489,60 @@ class BrowserAuth:
             logger.warning("[browser] injecting captcha token failed: %s", e)
 
     async def _handle_post_submit_captcha(self, page) -> None:
-        """If Riot showed an invisible hCaptcha challenge after submit, auto-
-        solve it. Runs in BOTH headless and GUI modes — if it succeeds the
-        user never has to touch the captcha; if it fails (e.g. visible
-        image challenge that solver can't handle) we fall through to manual
-        solving in GUI mode."""
+        """If Riot showed an hCaptcha challenge after submit, auto-solve it.
+        Detects whether it's an invisible or visible-image challenge and
+        passes the right flag to the captcha provider (RuCaptcha can solve
+        both, but only with the correct isInvisible setting)."""
+        (_AuthError, CaptchaRequired, *_) = _imports()
         try:
             await page.wait_for_selector(
                 'iframe[src*="hcaptcha"], [data-sitekey]',
-                timeout=8000,
+                timeout=10000,
             )
         except Exception:
             return  # no captcha popped
-        # Re-extract because rqdata may have changed
-        sitekey, rqdata = await self._extract_captcha_params(page)
+
+        # Give hCaptcha JS a moment to fully render (rqdata appears after JS init)
+        await page.wait_for_timeout(2000)
+        info = await self._extract_captcha_full(page)
+        sitekey = info.get("sitekey")
+        rqdata = info.get("rqdata")
+        invisible_first = bool(info.get("invisible"))
         if not sitekey:
+            logger.warning("[browser] post-submit captcha visible but no "
+                           "sitekey extractable — leaving for manual solve")
             return
-        logger.info("[browser] post-submit captcha challenge — solving")
-        try:
-            token = await self._captcha.solve_hcaptcha(
-                sitekey=sitekey,
-                page_url=page.url,
-                invisible=True,
-                rqdata=rqdata,
-            )
-        except CaptchaError as e:
-            raise CaptchaRequired(f"post-submit captcha failed: {e}")
+
+        # Try the detected mode first, then the opposite mode if it fails.
+        modes_to_try = [invisible_first, not invisible_first]
+        last_err: Optional[Exception] = None
+        token: Optional[str] = None
+        for mode in modes_to_try:
+            try:
+                logger.info("[browser] solving hCaptcha (invisible=%s, "
+                            "rqdata=%s, sitekey=%s…)",
+                            mode, "yes" if rqdata else "no", sitekey[:8])
+                token = await self._captcha.solve_hcaptcha(
+                    sitekey=sitekey,
+                    page_url=page.url,
+                    invisible=mode,
+                    rqdata=rqdata,
+                )
+                break
+            except CaptchaError as e:
+                logger.warning("[browser] solve(invisible=%s) failed: %s",
+                               mode, str(e)[:160])
+                last_err = e
+        if not token:
+            logger.warning("[browser] captcha unsolved by provider — falling "
+                           "through to manual solve. Last error: %s", last_err)
+            return
+
         await self._inject_captcha_token(page, token)
-        # Re-submit
+        # Try to submit again — many forms auto-submit on token, but in case:
         try:
             await page.click('button[type="submit"]', timeout=3000)
+            logger.info("[browser] form re-submitted after captcha solve")
         except Exception:
             try:
                 await page.press('input[type="password"]', "Enter")
