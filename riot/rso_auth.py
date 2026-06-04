@@ -127,7 +127,12 @@ def _make_state() -> str:
 
 def _build_login_url(code_challenge: str, state: str) -> str:
     """Build the URL the user's browser navigates to before login.
-    This sets up the OAuth/PKCE session on the server side."""
+    This sets up the OAuth/PKCE session on the server side.
+
+    Riot's /api/v1/login returns 400 + X-Rso-Error-Id: 40000020 when any
+    required OAuth param is missing. Notably the outer authenticate URL
+    also needs code_challenge_method=S256 (not just the inner redirect).
+    """
     inner_redirect = (
         "https://auth.riotgames.com/authorize"
         "?client_id=prod-xsso-riotgames"
@@ -142,9 +147,13 @@ def _build_login_url(code_challenge: str, state: str) -> str:
         "https://authenticate.riotgames.com/"
         "?client_id=prod-xsso-riotgames"
         f"&code_challenge={code_challenge}"
+        "&code_challenge_method=S256"
         "&method=riot_identity"
         "&platform=web"
         "&redirect_uri=" + quote(inner_redirect, safe="")
+        + "&response_type=code"
+        "&scope=" + quote("openid account email offline_access", safe="")
+        + f"&state={state}"
         + "&security_profile=low"
     )
 
