@@ -114,14 +114,30 @@ class BrowserAuth:
         (AuthError, CaptchaRequired, InvalidCredentials, MfaRequired,
          RateLimited, RiotTokens, RsoAuth, _make_session) = _imports()
 
+        # Prefer patchright (Playwright fork with anti-detection patches —
+        # passes Cloudflare/Riot bot checks where vanilla Playwright fails).
+        # Fall back to plain playwright if patchright isn't installed.
+        async_playwright = None
         try:
-            from playwright.async_api import async_playwright
+            from patchright.async_api import async_playwright as _ap
+            async_playwright = _ap
+            logger.info("[browser] using patchright (anti-detect Playwright)")
         except ImportError:
-            raise AuthError(
-                "Playwright is not installed. Run: "
-                ".venv\\Scripts\\pip install playwright && "
-                ".venv\\Scripts\\playwright install chromium"
-            )
+            try:
+                from playwright.async_api import async_playwright as _ap
+                async_playwright = _ap
+                logger.warning(
+                    "[browser] patchright not installed — using stock playwright. "
+                    "Riot will likely detect this. Run: "
+                    ".venv\\Scripts\\pip install patchright && "
+                    ".venv\\Scripts\\patchright install chromium"
+                )
+            except ImportError:
+                raise AuthError(
+                    "No browser engine installed. Run: "
+                    ".venv\\Scripts\\pip install patchright && "
+                    ".venv\\Scripts\\patchright install chromium"
+                )
 
         if not self._captcha.enabled:
             raise CaptchaError(
@@ -138,6 +154,9 @@ class BrowserAuth:
         headless = bool(getattr(settings, "RIOT_HEADLESS", True))
         logger.info("[browser] headless=%s", headless)
 
+        # Detect whether we're using patchright (anti-detect) or stock playwright
+        is_patchright = "patchright" in async_playwright.__module__
+
         # Use a persistent profile so Cloudflare's cf_clearance cookie
         # survives between runs. After the first successful pass, subsequent
         # runs skip the JS challenge entirely.
@@ -149,15 +168,18 @@ class BrowserAuth:
         # Try real Chrome first (Cloudflare rarely blocks it), fall back to
         # bundled Chromium if Chrome isn't installed on the host.
         async with async_playwright() as pw:
-            launch_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                # Disable "Chrome is being controlled by automated test
-                # software" infobar — the most visible automation tell.
-                "--disable-infobars",
-                "--exclude-switches=enable-automation",
-            ]
+            # patchright is already stealth — minimal args. stock playwright
+            # needs every flag we can throw at it.
+            if is_patchright:
+                launch_args = []
+            else:
+                launch_args = [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-infobars",
+                    "--exclude-switches=enable-automation",
+                ]
             ctx = None
             for channel_name in ("chrome", None):  # None = bundled chromium
                 try:
@@ -190,7 +212,10 @@ class BrowserAuth:
                 )
 
             try:
-                await ctx.add_init_script(self.STEALTH_INIT)
+                # patchright already injects proper stealth — adding our
+                # manual init_script can actually flag the browser.
+                if not is_patchright:
+                    await ctx.add_init_script(self.STEALTH_INIT)
                 # Reuse existing page if one came with the persistent context
                 page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                 page.set_default_timeout(45000)

@@ -2,6 +2,7 @@ aiogram>=3.13.0,<4.0
 httpx[socks]>=0.27.0,<1.0
 beautifulsoup4>=4.12.3
 playwright>=1.47.0
+patchright>=1.47.0
 sqlalchemy>=2.0.30,<3.0
 aiosqlite>=0.20.0
 python-dotenv>=1.0.1
