@@ -133,27 +133,61 @@ class BrowserAuth:
         headless = bool(getattr(settings, "RIOT_HEADLESS", True))
         logger.info("[browser] headless=%s", headless)
 
+        # Use a persistent profile so Cloudflare's cf_clearance cookie
+        # survives between runs. After the first successful pass, subsequent
+        # runs skip the JS challenge entirely.
+        from pathlib import Path
+        profile_dir = Path("riot_profiles") / "playwright_chrome"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("[browser] persistent profile: %s", profile_dir)
+
+        # Try real Chrome first (Cloudflare rarely blocks it), fall back to
+        # bundled Chromium if Chrome isn't installed on the host.
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=headless,
-                proxy=proxy_cfg,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
-            try:
-                ctx = await browser.new_context(
-                    user_agent=self.USER_AGENT,
-                    locale="en-US",
-                    viewport={"width": 1920, "height": 1080},
-                    extra_http_headers={
-                        "Accept-Language": "en-US,en;q=0.9",
-                    },
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                # Disable "Chrome is being controlled by automated test
+                # software" infobar — the most visible automation tell.
+                "--disable-infobars",
+                "--exclude-switches=enable-automation",
+            ]
+            ctx = None
+            for channel_name in ("chrome", None):  # None = bundled chromium
+                try:
+                    launch_kwargs = {
+                        "user_data_dir": str(profile_dir),
+                        "headless": headless,
+                        "proxy": proxy_cfg,
+                        "args": launch_args,
+                        "viewport": {"width": 1920, "height": 1080},
+                        "locale": "en-US",
+                        "user_agent": self.USER_AGENT,
+                        "extra_http_headers": {
+                            "Accept-Language": "en-US,en;q=0.9",
+                        },
+                    }
+                    if channel_name:
+                        launch_kwargs["channel"] = channel_name
+                    ctx = await pw.chromium.launch_persistent_context(**launch_kwargs)
+                    logger.info("[browser] launched %s",
+                                channel_name or "bundled-chromium")
+                    break
+                except Exception as e:
+                    logger.warning("[browser] %s launch failed: %s",
+                                   channel_name or "chromium", str(e)[:120])
+                    continue
+            if ctx is None:
+                raise AuthError(
+                    "Could not launch any browser. "
+                    "Install Chrome OR run `playwright install chromium`."
                 )
+
+            try:
                 await ctx.add_init_script(self.STEALTH_INIT)
-                page = await ctx.new_page()
+                # Reuse existing page if one came with the persistent context
+                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                 page.set_default_timeout(45000)
 
                 # Step 1: Land on Riot's homepage, then click Sign In so
@@ -270,7 +304,7 @@ class BrowserAuth:
                     )
             finally:
                 try:
-                    await browser.close()
+                    await ctx.close()
                 except Exception:
                     pass
 
@@ -325,7 +359,18 @@ class BrowserAuth:
                     except Exception:
                         continue
                 if not clicked:
-                    logger.info("[browser] no sign-in link on %s — trying next", entry)
+                    # Dump diagnostic info — likely Cloudflare blocked the page
+                    try:
+                        info = await page.evaluate("""() => ({
+                            title: document.title,
+                            bodyLen: (document.body?.innerText || '').length,
+                            hasCloudflare: !!document.querySelector('[id*="cf-"], [class*="cf-"]'),
+                            linkCount: document.querySelectorAll('a').length,
+                        })""")
+                        logger.warning("[browser] %s: no sign-in found. %s",
+                                       entry, info)
+                    except Exception:
+                        pass
                     continue
                 # Wait for navigation to authenticate.* or for the form to appear.
                 await page.wait_for_url(
