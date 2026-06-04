@@ -45,6 +45,7 @@ from urllib.parse import quote, urlencode
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
+from aiohttp_socks._errors import ProxyError as _SocksProxyError, ProxyConnectionError as _SocksProxyConnError
 
 from config import settings
 from riot.captcha import CaptchaError, CaptchaSolver
@@ -292,31 +293,43 @@ class RsoAuth:
         state = _make_state()
         login_url = _build_login_url(code_challenge, state)
 
-        # Retry session creation up to 5x — residential rotating proxies
+        # Retry session creation up to 8x — residential rotating proxies
         # often return 407/502 on first connection while waiting for an
         # exit-node to be assigned. Each new session = new connector =
         # new chance at a healthy exit-node.
         last_proxy_err: Optional[Exception] = None
         sess = None
-        for attempt in range(1, 6):
+        MAX_ATTEMPTS = 8
+        for attempt in range(1, MAX_ATTEMPTS + 1):
             sess = _make_session(proxy)
             _p = getattr(sess, "_rso_per_request_proxy", None)
             try:
-                # quick probe — if proxy is bad we'll find out here
                 async with sess.get(login_url, proxy=_p, allow_redirects=False) as probe:
                     if probe.status >= 500 or probe.status == 407:
                         raise aiohttp.ClientError(f"proxy returned HTTP {probe.status}")
-                    # success — re-do the request below for full flow
+                    logger.info("[RSO] proxy OK on attempt %d (HTTP %s)",
+                                attempt, probe.status)
                     break
-            except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as e:
+            except (
+                aiohttp.ClientError, OSError, asyncio.TimeoutError,
+                _SocksProxyError, _SocksProxyConnError,
+            ) as e:
                 last_proxy_err = e
-                logger.warning("[RSO] proxy attempt %d/5 failed: %s — retrying",
-                               attempt, str(e)[:120])
-                await sess.close()
+                logger.warning("[RSO] proxy attempt %d/%d failed: %s — retrying",
+                               attempt, MAX_ATTEMPTS, str(e)[:160])
+                try:
+                    await sess.close()
+                except Exception:
+                    pass
                 sess = None
-                await asyncio.sleep(1.5)
+                # Backoff: 2s, 3s, 4s... up to 10s
+                await asyncio.sleep(min(1 + attempt, 10))
         if sess is None:
-            raise AuthError(f"Proxy unreachable after 5 attempts: {last_proxy_err}")
+            raise AuthError(
+                f"Proxy unreachable after {MAX_ATTEMPTS} attempts. "
+                f"Last error: {last_proxy_err}. "
+                f"Check ASocks balance / try regenerating the proxy URL."
+            )
 
         async with sess:
             _p = getattr(sess, "_rso_per_request_proxy", None)
