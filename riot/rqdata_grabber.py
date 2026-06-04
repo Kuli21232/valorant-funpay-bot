@@ -15,9 +15,30 @@ Returns (sitekey, rqdata) or (sitekey, None) if rqdata couldn't be found.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
+from urllib.parse import urlparse
+
+from config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _build_playwright_proxy() -> Optional[dict]:
+    """Convert RIOT_PROXY (.env URL) → Playwright proxy dict."""
+    raw = (settings.RIOT_PROXY or "").strip()
+    if not raw:
+        return None
+    u = urlparse(raw)
+    if not u.hostname or not u.port:
+        return None
+    server = f"{u.scheme}://{u.hostname}:{u.port}"
+    proxy_cfg = {"server": server}
+    if u.username:
+        proxy_cfg["username"] = u.username
+    if u.password:
+        proxy_cfg["password"] = u.password
+    return proxy_cfg
 
 
 async def grab_hcaptcha_params(page_url: str, timeout_seconds: int = 30) -> tuple[Optional[str], Optional[str]]:
@@ -29,9 +50,22 @@ async def grab_hcaptcha_params(page_url: str, timeout_seconds: int = 30) -> tupl
         logger.warning("[rqdata] playwright not installed — can't extract rqdata")
         return None, None
 
+    proxy_cfg = _build_playwright_proxy()
+    if proxy_cfg:
+        logger.info("[rqdata] using proxy: %s", proxy_cfg["server"])
+    else:
+        logger.warning(
+            "[rqdata] no RIOT_PROXY set — Playwright will hit Riot from your "
+            "real IP. If you're in RU/CIS, Riot will serve a blank/blocked "
+            "page and rqdata will be missing → captcha will be rejected."
+        )
+
     try:
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
+            launch_kwargs = {"headless": True}
+            if proxy_cfg:
+                launch_kwargs["proxy"] = proxy_cfg
+            browser = await pw.chromium.launch(**launch_kwargs)
             try:
                 ctx = await browser.new_context(
                     user_agent=(
