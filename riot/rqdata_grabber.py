@@ -62,7 +62,26 @@ async def grab_hcaptcha_params(page_url: str, timeout_seconds: int = 30) -> tupl
 
     try:
         async with async_playwright() as pw:
-            launch_kwargs = {"headless": True}
+            # Cloudflare/Riot detect headless Chromium via:
+            #   - navigator.webdriver = true
+            #   - missing window.chrome
+            #   - HeadlessChrome in UA
+            # Use --headless=new + disable automation flags + a real UA.
+            # Allow user to disable headless via RIOT_HEADLESS=False in .env —
+            # useful when Cloudflare still detects headless mode (rare, but
+            # happens on heavily-protected pages).
+            use_headless = bool(getattr(settings, "RIOT_HEADLESS", True))
+            launch_kwargs = {
+                "headless": use_headless,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-web-security",
+                    "--disable-features=AutomationControlled",
+                ],
+            }
             if proxy_cfg:
                 launch_kwargs["proxy"] = proxy_cfg
             browser = await pw.chromium.launch(**launch_kwargs)
@@ -74,7 +93,26 @@ async def grab_hcaptcha_params(page_url: str, timeout_seconds: int = 30) -> tupl
                         "Chrome/124.0.0.0 Safari/537.36"
                     ),
                     locale="en-US",
+                    viewport={"width": 1920, "height": 1080},
+                    extra_http_headers={
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Accept": (
+                            "text/html,application/xhtml+xml,application/xml;"
+                            "q=0.9,image/webp,*/*;q=0.8"
+                        ),
+                    },
                 )
+                # Hide webdriver flag — most basic anti-bot check
+                await ctx.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    window.chrome = { runtime: {} };
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-US', 'en']
+                    });
+                """)
                 page = await ctx.new_page()
                 page.set_default_timeout(timeout_seconds * 1000)
                 await page.goto(page_url, wait_until="networkidle")
