@@ -77,9 +77,32 @@ async def grab_hcaptcha_params(page_url: str, timeout_seconds: int = 30) -> tupl
                 )
                 page = await ctx.new_page()
                 page.set_default_timeout(timeout_seconds * 1000)
-                await page.goto(page_url, wait_until="domcontentloaded")
-                # React app mount + hCaptcha attach takes a few seconds
-                await page.wait_for_timeout(3000)
+                await page.goto(page_url, wait_until="networkidle")
+                # React app mount + hCaptcha attach takes time — wait for
+                # the captcha iframe OR a visible password field (= form
+                # fully rendered → hCaptcha will have attached too).
+                try:
+                    await page.wait_for_selector(
+                        'iframe[src*="hcaptcha"], [data-sitekey], '
+                        'input[type="password"]',
+                        timeout=20000,
+                    )
+                except Exception:
+                    logger.warning("[rqdata] no captcha/password selector after 20s")
+                # Extra settle for hCaptcha JS to write rqdata into the DOM
+                await page.wait_for_timeout(4000)
+                # Quick visibility into what's on the page
+                try:
+                    snapshot = await page.evaluate("""() => ({
+                        url: location.href,
+                        hasHcaptchaIframe: !!document.querySelector('iframe[src*=\"hcaptcha\"]'),
+                        hasDataSitekey: !!document.querySelector('[data-sitekey]'),
+                        hasPasswordField: !!document.querySelector('input[type=\"password\"]'),
+                        bodyLen: (document.body && document.body.innerText.length) || 0,
+                    })""")
+                    logger.info("[rqdata] snapshot: %s", snapshot)
+                except Exception:
+                    pass
 
                 # Try to find the captcha element and pull data-rqdata
                 # Multiple selectors because Riot's UI mutates
