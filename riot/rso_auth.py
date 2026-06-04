@@ -44,6 +44,7 @@ from typing import Optional
 from urllib.parse import quote, urlencode
 
 import aiohttp
+from aiohttp_socks import ProxyConnector
 
 from config import settings
 from riot.captcha import CaptchaError, CaptchaSolver
@@ -155,11 +156,21 @@ def _make_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-def _make_session() -> aiohttp.ClientSession:
-    connector = aiohttp.TCPConnector(ssl=_make_ssl_context(), force_close=False)
-    # unsafe=True allows cookies on IP-addressed hosts too; with default
-    # quoting policy aiohttp can drop cookies that have unusual chars.
-    return aiohttp.ClientSession(
+def _make_session(proxy: Optional[str] = None) -> aiohttp.ClientSession:
+    """Create aiohttp session. For SOCKS5/SOCKS4 proxies uses ProxyConnector
+    (aiohttp-socks), because aiohttp's built-in proxy support only handles HTTP.
+    For HTTP proxies the connector is a plain TCPConnector and the proxy URL is
+    passed per-request as usual."""
+    ssl_ctx = _make_ssl_context()
+    if proxy and proxy.lower().startswith(("socks5://", "socks4://", "socks4a://")):
+        connector = ProxyConnector.from_url(proxy, ssl=ssl_ctx, force_close=False)
+        # ProxyConnector handles routing — don't pass proxy= on individual requests
+        _session_proxy = None
+    else:
+        connector = aiohttp.TCPConnector(ssl=ssl_ctx, force_close=False)
+        _session_proxy = proxy  # will be passed per-request
+
+    session = aiohttp.ClientSession(
         connector=connector,
         headers={
             "User-Agent": _RIOT_UA_BROWSER,
@@ -169,6 +180,9 @@ def _make_session() -> aiohttp.ClientSession:
         timeout=aiohttp.ClientTimeout(total=120),
         cookie_jar=aiohttp.CookieJar(unsafe=True),
     )
+    # Attach resolved per-request proxy (None for SOCKS — connector handles it)
+    session._rso_per_request_proxy = _session_proxy
+    return session
 
 
 # ----- helpers ----------------------------------------------------------------
@@ -274,12 +288,14 @@ class RsoAuth:
         state = _make_state()
         login_url = _build_login_url(code_challenge, state)
 
-        async with _make_session() as sess:
+        async with _make_session(proxy) as sess:
+            # For SOCKS proxies the connector handles routing — per-request proxy=None
+            _p = getattr(sess, "_rso_per_request_proxy", None)
             # Step 1: load the authenticate page to set authenticator.sid cookie
             #         and discover the hCaptcha sitekey from HTML.
             # We start with allow_redirects=False so we can see exactly what
             # Riot returns (302 vs 200) and preserve all Set-Cookie headers.
-            async with sess.get(login_url, proxy=proxy, allow_redirects=False) as r:
+            async with sess.get(login_url, proxy=_p, allow_redirects=False) as r:
                 html = await r.text()
                 set_cookie_hdrs = r.headers.getall("Set-Cookie", [])
                 logger.info("[RSO] GET authenticate.* → HTTP %s, %d bytes, Set-Cookie x%d",
@@ -290,7 +306,7 @@ class RsoAuth:
                 if 300 <= r.status < 400:
                     location = r.headers.get("Location", "")
                     logger.info("[RSO] following redirect → %s", location[:200])
-                    async with sess.get(location, proxy=proxy, allow_redirects=True) as r2:
+                    async with sess.get(location, proxy=_p, allow_redirects=True) as r2:
                         html = await r2.text()
                         logger.info("[RSO] after redirect → HTTP %s, %d bytes",
                                     r2.status, len(html))
@@ -379,7 +395,7 @@ class RsoAuth:
                     },
                 }
                 async with sess.put(self.LOGIN_API, json=payload, headers=headers,
-                                    proxy=proxy, allow_redirects=False) as r:
+                                    proxy=_p, allow_redirects=False) as r:
                     logger.info("[RSO] PUT /api/v1/login → HTTP %s", r.status)
                     resp = await r.json(content_type=None)
                     raw_txt = await r.text() if logger.isEnabledFor(logging.WARNING) else ""
@@ -399,7 +415,7 @@ class RsoAuth:
                     self.LOGIN_API,
                     json={"type": "multifactor", "code": mfa_code,
                           "rememberDevice": True},
-                    headers=headers, proxy=proxy, allow_redirects=False,
+                    headers=headers, proxy=_p, allow_redirects=False,
                 ) as r:
                     logger.info("[RSO] MFA PUT → HTTP %s", r.status)
                     data = await r.json(content_type=None)
@@ -453,7 +469,7 @@ class RsoAuth:
                     "https://auth.riotgames.com/api/v1/authorization",
                     json=legacy_body,
                     headers=legacy_headers,
-                    proxy=proxy,
+                    proxy=_p,
                     allow_redirects=False,
                 ) as r2:
                     logger.info("[RSO] legacy POST → HTTP %s", r2.status)
@@ -470,7 +486,7 @@ class RsoAuth:
 
             # Visit the auth.riotgames.com/authorize?...&code=... URL.
             # Riot will set __Secure-access_token, ssid, etc. as cookies.
-            async with sess.get(redirect_uri, proxy=proxy, allow_redirects=True) as r:
+            async with sess.get(redirect_uri, proxy=_p, allow_redirects=True) as r:
                 logger.info("[RSO] follow redirect → HTTP %s, final URL=%s",
                             r.status, str(r.url)[:120])
 
@@ -489,9 +505,9 @@ class RsoAuth:
                          datetime.utcnow() + timedelta(hours=1)
 
             # Step 5: fetch entitlement, puuid, region
-            entitlement = await self._fetch_entitlement(sess, access_token, proxy)
-            puuid = await self._fetch_puuid(sess, access_token, proxy)
-            region = await self._fetch_region(sess, access_token, id_token, proxy)
+            entitlement = await self._fetch_entitlement(sess, access_token, _p)
+            puuid = await self._fetch_puuid(sess, access_token, _p)
+            region = await self._fetch_region(sess, access_token, id_token, _p)
 
             tokens = RiotTokens(
                 access_token=access_token,
@@ -531,12 +547,13 @@ class RsoAuth:
             + f"&state={state}"
         )
 
-        async with _make_session() as sess:
+        async with _make_session(proxy) as sess:
+            _p = getattr(sess, "_rso_per_request_proxy", None)
             sess.cookie_jar.update_cookies(
                 {"ssid": ssid},
                 response_url=aiohttp.helpers.URL("https://auth.riotgames.com"),
             )
-            async with sess.get(authorize_url, proxy=proxy, allow_redirects=True) as r:
+            async with sess.get(authorize_url, proxy=_p, allow_redirects=True) as r:
                 final = str(r.url)
                 logger.info("[RSO] refresh authorize → HTTP %s, final=%s",
                             r.status, final[:120])
@@ -550,9 +567,9 @@ class RsoAuth:
 
             expires_at = self._decode_jwt_exp(access_token) or \
                          datetime.utcnow() + timedelta(hours=1)
-            entitlement = await self._fetch_entitlement(sess, access_token, proxy)
-            puuid = await self._fetch_puuid(sess, access_token, proxy)
-            region = await self._fetch_region(sess, access_token, id_token, proxy)
+            entitlement = await self._fetch_entitlement(sess, access_token, _p)
+            puuid = await self._fetch_puuid(sess, access_token, _p)
+            region = await self._fetch_region(sess, access_token, id_token, _p)
 
             tokens = RiotTokens(
                 access_token=access_token,
