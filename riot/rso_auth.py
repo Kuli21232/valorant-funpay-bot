@@ -292,8 +292,33 @@ class RsoAuth:
         state = _make_state()
         login_url = _build_login_url(code_challenge, state)
 
-        async with _make_session(proxy) as sess:
-            # For SOCKS proxies the connector handles routing — per-request proxy=None
+        # Retry session creation up to 5x — residential rotating proxies
+        # often return 407/502 on first connection while waiting for an
+        # exit-node to be assigned. Each new session = new connector =
+        # new chance at a healthy exit-node.
+        last_proxy_err: Optional[Exception] = None
+        sess = None
+        for attempt in range(1, 6):
+            sess = _make_session(proxy)
+            _p = getattr(sess, "_rso_per_request_proxy", None)
+            try:
+                # quick probe — if proxy is bad we'll find out here
+                async with sess.get(login_url, proxy=_p, allow_redirects=False) as probe:
+                    if probe.status >= 500 or probe.status == 407:
+                        raise aiohttp.ClientError(f"proxy returned HTTP {probe.status}")
+                    # success — re-do the request below for full flow
+                    break
+            except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as e:
+                last_proxy_err = e
+                logger.warning("[RSO] proxy attempt %d/5 failed: %s — retrying",
+                               attempt, str(e)[:120])
+                await sess.close()
+                sess = None
+                await asyncio.sleep(1.5)
+        if sess is None:
+            raise AuthError(f"Proxy unreachable after 5 attempts: {last_proxy_err}")
+
+        async with sess:
             _p = getattr(sess, "_rso_per_request_proxy", None)
             # Step 1: load the authenticate page to set authenticator.sid cookie
             #         and discover the hCaptcha sitekey from HTML.
