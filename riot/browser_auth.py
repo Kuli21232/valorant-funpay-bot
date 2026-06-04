@@ -332,15 +332,15 @@ class BrowserAuth:
                         "Login finished but no ssid cookie. "
                         f"Got: {list(jar.keys())}"
                     )
-                # account.riotgames.com sets `sid`/`id_token`/`csid` but NOT
-                # __Secure-access_token. We need RSO access_token — fetch it
-                # by driving the same browser to auth.riotgames.com/authorize
-                # for an actual game client. ssid is shared across riotgames.com
-                # so the authorize call returns code → exchanged for tokens.
+                # account.riotgames.com sets `sid`/`id_token`/`csid` + ssid
+                # but NOT __Secure-access_token. ssid is the cross-client
+                # SSO cookie — pass it to the legacy authorization endpoint
+                # (used by Valorant client itself) to mint RSO tokens.
                 if not access_token:
-                    logger.info("[browser] fetching RSO tokens via "
-                                "auth.riotgames.com/authorize (ssid SSO)")
-                    access_token, id_token, ssid = await self._fetch_rso_tokens(page, jar)
+                    logger.info("[browser] minting RSO tokens via "
+                                "/api/v1/authorization (ssid SSO)")
+                    access_token, id_token, ssid = \
+                        await self._mint_rso_via_legacy(ssid, proxy)
             finally:
                 try:
                     await ctx.close()
@@ -565,6 +565,109 @@ class BrowserAuth:
                 await page.press('input[type="password"]', "Enter")
             except Exception:
                 pass
+
+    async def _mint_rso_via_legacy(self, ssid: str, proxy: Optional[str]
+                                    ) -> tuple[str, str, str]:
+        """Mint RSO access_token + id_token via auth.riotgames.com/api/v1/
+        authorization — the same endpoint the native Valorant client uses.
+        With a valid ssid cookie this returns the token URL fragment without
+        prompting for credentials/captcha."""
+        (AuthError, _CR, _IC, _MR, _RL, _RT, _RsoAuth, _make_session) = _imports()
+        import aiohttp
+        from aiohttp.helpers import URL as _AHURL
+
+        # Multiple known client_id / redirect combos used by Riot itself.
+        # Try the strictest (Valorant client) first, fall back to LoL etc.
+        attempts = [
+            {
+                "client_id": "play-valorant",
+                "nonce": "1",
+                "redirect_uri": "https://playvalorant.com/opt_in",
+                "response_type": "token id_token",
+                "scope": "account openid",
+            },
+            {
+                "client_id": "riot-client",
+                "nonce": "1",
+                "redirect_uri": "http://localhost/redirect",
+                "response_type": "token id_token",
+                "scope": "openid link ban lol_region account",
+            },
+            {
+                "client_id": "lol",
+                "nonce": "1",
+                "redirect_uri": "http://localhost/redirect",
+                "response_type": "token id_token",
+                "scope": "openid",
+            },
+        ]
+
+        last_err: Optional[str] = None
+        async with _make_session(proxy) as sess:
+            _p = getattr(sess, "_rso_per_request_proxy", None)
+            # Prime the cookie jar with ssid on the .riotgames.com domain.
+            sess.cookie_jar.update_cookies(
+                {"ssid": ssid},
+                response_url=_AHURL("https://auth.riotgames.com"),
+            )
+
+            for body in attempts:
+                cid = body["client_id"]
+                try:
+                    async with sess.post(
+                        "https://auth.riotgames.com/api/v1/authorization",
+                        json=body, proxy=_p, allow_redirects=False,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Accept": "application/json",
+                            "User-Agent": (
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/124.0.0.0 Safari/537.36"
+                            ),
+                        },
+                    ) as r:
+                        data = await r.json(content_type=None)
+                        logger.info("[browser] /api/v1/authorization "
+                                    "(%s) → HTTP %s, type=%s",
+                                    cid, r.status, data.get("type"))
+                except Exception as e:
+                    last_err = f"{cid}: HTTP error {e}"
+                    logger.warning("[browser] %s", last_err)
+                    continue
+
+                if data.get("type") == "response":
+                    uri = (data.get("response", {})
+                                .get("parameters", {}).get("uri", ""))
+                    # token & id_token come back as URL fragment:
+                    #   https://.../#access_token=...&id_token=...&...
+                    frag_re = re.compile(
+                        r"[#&](access_token|id_token)=([^&]+)"
+                    )
+                    found: dict = {}
+                    for m in frag_re.finditer(uri):
+                        found[m.group(1)] = m.group(2)
+                    access_token = found.get("access_token")
+                    id_token = found.get("id_token")
+                    if access_token and id_token:
+                        # Refresh ssid if Riot rotated it
+                        new_ssid = ssid
+                        for c in sess.cookie_jar:
+                            if c.key == "ssid":
+                                new_ssid = c.value
+                                break
+                        logger.info("[browser] RSO tokens minted via %s", cid)
+                        return access_token, id_token, new_ssid
+                    last_err = f"{cid}: no tokens in fragment ({uri[:120]})"
+                else:
+                    last_err = (f"{cid}: type={data.get('type')} "
+                                f"error={data.get('error')}")
+                logger.warning("[browser] %s", last_err)
+
+        raise Exception(
+            f"All authorization attempts failed (last: {last_err}). "
+            f"ssid was: {ssid[:20]}…"
+        )
 
     async def _fetch_rso_tokens(self, page, jar: dict) -> tuple[str, str, str]:
         """After logging into account.riotgames.com we have an ssid SSO cookie
