@@ -325,13 +325,22 @@ class BrowserAuth:
                 logger.info("[browser] cookies after login: %s",
                             sorted(jar.keys()))
                 access_token = jar.get("__Secure-access_token")
-                id_token = jar.get("__Secure-id_token")
+                id_token = jar.get("__Secure-id_token") or jar.get("id_token")
                 ssid = jar.get("ssid", "")
-                if not access_token or not id_token:
+                if not ssid:
                     raise AuthError(
-                        "Login finished but no RSO tokens in cookies. "
+                        "Login finished but no ssid cookie. "
                         f"Got: {list(jar.keys())}"
                     )
+                # account.riotgames.com sets `sid`/`id_token`/`csid` but NOT
+                # __Secure-access_token. We need RSO access_token — fetch it
+                # by driving the same browser to auth.riotgames.com/authorize
+                # for an actual game client. ssid is shared across riotgames.com
+                # so the authorize call returns code → exchanged for tokens.
+                if not access_token:
+                    logger.info("[browser] fetching RSO tokens via "
+                                "auth.riotgames.com/authorize (ssid SSO)")
+                    access_token, id_token, ssid = await self._fetch_rso_tokens(page, jar)
             finally:
                 try:
                     await ctx.close()
@@ -556,6 +565,92 @@ class BrowserAuth:
                 await page.press('input[type="password"]', "Enter")
             except Exception:
                 pass
+
+    async def _fetch_rso_tokens(self, page, jar: dict) -> tuple[str, str, str]:
+        """After logging into account.riotgames.com we have an ssid SSO cookie
+        but no RSO access_token. Navigate the same browser context to an
+        auth.riotgames.com/authorize URL for the Valorant web client — Riot
+        recognises the SSO ssid and writes __Secure-access_token /
+        __Secure-id_token into the cookie jar without prompting again."""
+        import secrets, hashlib, base64
+        from urllib.parse import quote
+
+        verifier = secrets.token_urlsafe(64)[:64]
+        challenge = (
+            base64.urlsafe_b64encode(
+                hashlib.sha256(verifier.encode()).digest()
+            ).decode().rstrip("=")
+        )
+        state = secrets.token_hex(20)
+
+        # play-valorant-web-prod is the web client Riot itself uses on
+        # playvalorant.com / valorant esports — known to mint RSO tokens
+        # cleanly when an ssid is already present.
+        authorize_url = (
+            "https://auth.riotgames.com/authorize"
+            "?client_id=play-valorant-web-prod"
+            f"&code_challenge={challenge}"
+            "&code_challenge_method=S256"
+            "&redirect_uri=" + quote("https://playvalorant.com/", safe="")
+            + "&response_type=code"
+            "&scope=" + quote("openid account email", safe="")
+            + f"&state={state}"
+        )
+        logger.info("[browser] navigating to authorize URL for Valorant client")
+        try:
+            await page.goto(authorize_url, wait_until="domcontentloaded",
+                            timeout=30000)
+        except Exception as e:
+            logger.warning("[browser] authorize nav: %s", str(e)[:120])
+        # Give cookies a moment to settle
+        await page.wait_for_timeout(2000)
+
+        # Re-read cookies from the context
+        cookies = await page.context.cookies()
+        jar2 = {c["name"]: c["value"] for c in cookies}
+        logger.info("[browser] cookies after authorize: %s", sorted(jar2.keys()))
+
+        access_token = (jar2.get("__Secure-access_token")
+                        or jar2.get("access_token"))
+        id_token = (jar2.get("__Secure-id_token")
+                    or jar2.get("id_token"))
+        ssid = jar2.get("ssid", jar.get("ssid", ""))
+
+        if not access_token or not id_token:
+            # Fallback: try the prod-xsso-riotgames client too.
+            logger.warning("[browser] play-valorant-web-prod didn't mint "
+                           "tokens, trying prod-xsso-riotgames")
+            authorize_url2 = (
+                "https://auth.riotgames.com/authorize"
+                "?client_id=prod-xsso-riotgames"
+                f"&code_challenge={challenge}"
+                "&code_challenge_method=S256"
+                "&redirect_uri=" + quote("https://xsso.riotgames.com/redirect", safe="")
+                + "&response_type=code"
+                "&scope=" + quote("openid account email offline_access", safe="")
+                + f"&state={state}"
+            )
+            try:
+                await page.goto(authorize_url2, wait_until="domcontentloaded",
+                                timeout=30000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(2000)
+            cookies = await page.context.cookies()
+            jar3 = {c["name"]: c["value"] for c in cookies}
+            access_token = (access_token or jar3.get("__Secure-access_token")
+                            or jar3.get("access_token"))
+            id_token = (id_token or jar3.get("__Secure-id_token")
+                        or jar3.get("id_token"))
+            ssid = jar3.get("ssid", ssid)
+
+        if not access_token or not id_token:
+            raise Exception(
+                "SSO authorize did not produce RSO tokens. "
+                f"Cookies seen: {sorted(set(jar.keys()) | set(jar2.keys()))}"
+            )
+        logger.info("[browser] RSO tokens obtained via SSO authorize")
+        return access_token, id_token, ssid
 
     async def _wait_for_logged_in(self, page) -> None:
         """Wait until Riot has redirected away from the login form.
