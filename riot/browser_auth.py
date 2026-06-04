@@ -567,50 +567,36 @@ class BrowserAuth:
                 pass
 
     async def _try_auto_mfa(self, page) -> bool:
-        """If IMAP_* is configured, read the inbox, extract the MFA code from
-        the Riot email, and type it into the form. Returns True on success."""
-        if not (settings.IMAP_HOST and settings.IMAP_USER
-                and settings.IMAP_PASSWORD):
-            return False
+        """Prompt the user for the MFA code in the terminal, then type it
+        into the form ourselves. Lets the user keep using the terminal —
+        no need to switch to the browser window."""
+        print()
+        print("=" * 60)
+        print("  Riot прислал MFA-код на почту.")
+        print("  Откройте письмо и введите 6-значный код ниже.")
+        print("=" * 60)
+        # Read from stdin without blocking the event loop
         try:
-            from email_client.imap_client import ImapClient
+            code = await asyncio.to_thread(input, "MFA код: ")
         except Exception as e:
-            logger.warning("[browser] IMAP client unavailable: %s", e)
+            logger.warning("[browser] failed to read MFA code from stdin: %s", e)
             return False
-
-        logger.info("[browser] MFA prompt detected — fetching code via IMAP "
-                    "(%s@%s)", settings.IMAP_USER, settings.IMAP_HOST)
-        code: Optional[str] = None
-        try:
-            async with ImapClient(
-                host=settings.IMAP_HOST,
-                port=settings.IMAP_PORT,
-                login=settings.IMAP_USER,
-                password=settings.IMAP_PASSWORD,
-            ) as ic:
-                # Baseline UID, then wait up to 90s for a new Riot email
-                baseline = await ic.get_max_uid()
-                logger.info("[browser] IMAP baseline UID=%d, waiting for "
-                            "Riot email…", baseline)
-                code = await ic.wait_for_riot_mfa_code(
-                    since_uid=baseline, timeout=90, poll_interval=4,
-                )
-        except Exception as e:
-            logger.warning("[browser] IMAP error: %s", e)
-            return False
-
+        code = (code or "").strip()
         if not code:
-            logger.warning("[browser] IMAP: no MFA code arrived in 90s")
+            logger.warning("[browser] empty MFA code entered — aborting")
             return False
-
-        # Type the code into the MFA field and submit
+        # Strip spaces/dashes that users sometimes paste
+        code = re.sub(r"[^0-9]", "", code)
+        if not code:
+            logger.warning("[browser] MFA code has no digits")
+            return False
+        # Type the code into the MFA field
         try:
             await page.fill(
                 'input[autocomplete="one-time-code"], '
                 'input[name="code"], input[name="multifactor"]',
                 code,
             )
-            # Either Riot auto-submits when 6 digits arrive, or we press Enter
             try:
                 await page.press(
                     'input[autocomplete="one-time-code"], '
@@ -619,8 +605,7 @@ class BrowserAuth:
                 )
             except Exception:
                 pass
-            logger.info("[browser] typed MFA code %s, waiting for redirect",
-                        code)
+            logger.info("[browser] typed MFA code, waiting for redirect")
             return True
         except Exception as e:
             logger.warning("[browser] failed to type MFA code: %s", e)
@@ -891,22 +876,15 @@ class BrowserAuth:
             )
             if has_mfa and not warned_mfa:
                 warned_mfa = True
-                # If IMAP credentials are configured, try to auto-fetch the
-                # code. Fall back to manual entry if it fails or isn't set.
+                # Ask the user for the code in the terminal — they don't have
+                # to click into the browser window.
                 got_code = await self._try_auto_mfa(page)
                 if got_code:
-                    logger.info("[browser] MFA code submitted automatically")
+                    logger.info("[browser] MFA code submitted from terminal")
                     continue
-                if headless:
-                    raise Exception(
-                        "MFA code required but browser is headless and "
-                        "IMAP_HOST is not set. Configure IMAP_* in .env "
-                        "for fully automated login, or set RIOT_HEADLESS=False."
-                    )
                 logger.warning(
-                    "[browser] MFA — check your email and enter the code in "
-                    "the open browser window. (Set IMAP_HOST in .env to "
-                    "auto-fetch.)"
+                    "[browser] MFA — enter the code directly in the open "
+                    "browser window."
                 )
 
             await asyncio.sleep(1)
