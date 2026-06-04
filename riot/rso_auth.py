@@ -286,6 +286,29 @@ class RsoAuth:
         mfa_code: Optional[str] = None,
         proxy: Optional[str] = None,
     ) -> RiotTokens:
+        # 2025+: Riot's authenticator rejects all API-flow URLs we can
+        # construct with `prompt.error: invalid_request`. The only flow that
+        # still works is the real browser one (Riot constructs its own
+        # valid OAuth URL after the user clicks "Sign In"). Delegate to
+        # BrowserAuth, which drives Playwright through the full form.
+        from riot.browser_auth import BrowserAuth
+        logger.info("[RSO] delegating to BrowserAuth (Playwright-driven flow)")
+        return await BrowserAuth().authenticate(
+            username=username, password=password,
+            mfa_code=mfa_code, proxy=proxy,
+        )
+
+    async def _authenticate_api_legacy(
+        self,
+        username: str,
+        password: str,
+        mfa_code: Optional[str] = None,
+        proxy: Optional[str] = None,
+    ) -> RiotTokens:
+        """Kept for reference / fallback — see `authenticate` above for the
+        live flow. Riot phased this out in 2025 (always returns
+        invalid_request), but the helpers (_fetch_entitlement etc.) below
+        are still used by BrowserAuth."""
         if not self._captcha.enabled:
             raise CaptchaError(
                 "No captcha provider configured. Set CAPSOLVER_KEY in .env "
