@@ -605,7 +605,23 @@ class BrowserAuth:
                 )
             except Exception:
                 pass
-            logger.info("[browser] typed MFA code, waiting for redirect")
+            logger.info("[browser] typed MFA code, waiting for redirect…")
+            # Wait until we leave authenticate.riotgames.com (i.e. login is
+            # complete) — give Riot up to 30s to validate + redirect.
+            try:
+                await page.wait_for_url(
+                    lambda u: "authenticate.riotgames.com" not in u,
+                    timeout=30000,
+                )
+                logger.info("[browser] post-MFA redirect: %s", page.url[:120])
+            except Exception as e:
+                logger.warning("[browser] post-MFA wait_for_url: %s — "
+                               "continuing with current URL", str(e)[:120])
+            # Also give the destination page a beat to settle (cookies, SPA)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
             return True
         except Exception as e:
             logger.warning("[browser] failed to type MFA code: %s", e)
