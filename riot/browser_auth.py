@@ -566,6 +566,66 @@ class BrowserAuth:
             except Exception:
                 pass
 
+    async def _try_auto_mfa(self, page) -> bool:
+        """If IMAP_* is configured, read the inbox, extract the MFA code from
+        the Riot email, and type it into the form. Returns True on success."""
+        if not (settings.IMAP_HOST and settings.IMAP_USER
+                and settings.IMAP_PASSWORD):
+            return False
+        try:
+            from email_client.imap_client import ImapClient
+        except Exception as e:
+            logger.warning("[browser] IMAP client unavailable: %s", e)
+            return False
+
+        logger.info("[browser] MFA prompt detected — fetching code via IMAP "
+                    "(%s@%s)", settings.IMAP_USER, settings.IMAP_HOST)
+        code: Optional[str] = None
+        try:
+            async with ImapClient(
+                host=settings.IMAP_HOST,
+                port=settings.IMAP_PORT,
+                login=settings.IMAP_USER,
+                password=settings.IMAP_PASSWORD,
+            ) as ic:
+                # Baseline UID, then wait up to 90s for a new Riot email
+                baseline = await ic.get_max_uid()
+                logger.info("[browser] IMAP baseline UID=%d, waiting for "
+                            "Riot email…", baseline)
+                code = await ic.wait_for_riot_mfa_code(
+                    since_uid=baseline, timeout=90, poll_interval=4,
+                )
+        except Exception as e:
+            logger.warning("[browser] IMAP error: %s", e)
+            return False
+
+        if not code:
+            logger.warning("[browser] IMAP: no MFA code arrived in 90s")
+            return False
+
+        # Type the code into the MFA field and submit
+        try:
+            await page.fill(
+                'input[autocomplete="one-time-code"], '
+                'input[name="code"], input[name="multifactor"]',
+                code,
+            )
+            # Either Riot auto-submits when 6 digits arrive, or we press Enter
+            try:
+                await page.press(
+                    'input[autocomplete="one-time-code"], '
+                    'input[name="code"], input[name="multifactor"]',
+                    "Enter",
+                )
+            except Exception:
+                pass
+            logger.info("[browser] typed MFA code %s, waiting for redirect",
+                        code)
+            return True
+        except Exception as e:
+            logger.warning("[browser] failed to type MFA code: %s", e)
+            return False
+
     async def _mint_rso_via_legacy(self, ssid: str, proxy: Optional[str]
                                     ) -> tuple[str, str, str]:
         """Mint RSO access_token + id_token via auth.riotgames.com/api/v1/
@@ -830,17 +890,24 @@ class BrowserAuth:
                 'input[name="multifactor"]'
             )
             if has_mfa and not warned_mfa:
+                warned_mfa = True
+                # If IMAP credentials are configured, try to auto-fetch the
+                # code. Fall back to manual entry if it fails or isn't set.
+                got_code = await self._try_auto_mfa(page)
+                if got_code:
+                    logger.info("[browser] MFA code submitted automatically")
+                    continue
                 if headless:
                     raise Exception(
-                        "MFA code required but browser is headless. Set "
-                        "RIOT_HEADLESS=False so you can enter the code "
-                        "from your email."
+                        "MFA code required but browser is headless and "
+                        "IMAP_HOST is not set. Configure IMAP_* in .env "
+                        "for fully automated login, or set RIOT_HEADLESS=False."
                     )
                 logger.warning(
                     "[browser] MFA — check your email and enter the code in "
-                    "the open browser window."
+                    "the open browser window. (Set IMAP_HOST in .env to "
+                    "auto-fetch.)"
                 )
-                warned_mfa = True
 
             await asyncio.sleep(1)
 

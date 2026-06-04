@@ -78,5 +78,18 @@ class Settings(BaseSettings):
     RIOT_HEADLESS: bool = False
     RIOT_TIMEOUT_MS: int = 45000
 
+    # IMAP credentials for auto-fetching Riot MFA codes from email.
+    # When set, BrowserAuth reads the inbox after Riot triggers MFA,
+    # extracts the 6-digit code, and types it into the form automatically.
+    # Common hosts:
+    #   Gmail:     imap.gmail.com  (use an "App password", not your Gmail one)
+    #   Yandex:    imap.yandex.com
+    #   firstmail: imap.firstmail.ltd
+    #   Outlook:   outlook.office365.com
+    IMAP_HOST: str = ""
+    IMAP_PORT: int = 993
+    IMAP_USER: str = ""
+    IMAP_PASSWORD: str = ""
+
 
 settings = Settings()
