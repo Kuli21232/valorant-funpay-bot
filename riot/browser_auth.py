@@ -67,18 +67,12 @@ def _playwright_proxy_cfg() -> Optional[dict]:
 # ----- main class ------------------------------------------------------------
 
 class BrowserAuth:
-    # Sign-in entry points we try in order.
-    #   account.riotgames.com — Riot's account dashboard. ALWAYS requires
-    #     login, so Riot immediately redirects (302) to authenticate.*
-    #     with a freshly-minted, valid OAuth URL. This is the most reliable
-    #     entry — no Sign-In button hunting required.
-    #   riotgames.com / playvalorant.com — fallback in case account.* is
-    #     somehow unreachable through the proxy.
-    ENTRY_URLS = [
-        "https://account.riotgames.com/",
-        "https://www.riotgames.com/en",
-        "https://playvalorant.com/en-us/",
-    ]
+    # Single entry: account.riotgames.com. It ALWAYS requires login, so
+    # Riot immediately redirects (302) to authenticate.* with a freshly-
+    # minted, valid OAuth URL. No fallback — if this is unreachable,
+    # something is wrong with the proxy and trying other URLs just
+    # introduces flaky retries.
+    ENTRY_URL = "https://account.riotgames.com/"
 
     # Selectors for "Sign In" links/buttons across Riot sites (text varies by
     # locale, so we use a fuzzy regex).
@@ -377,97 +371,33 @@ class BrowserAuth:
     # --------- internals ---------
 
     async def _goto_login_form(self, page) -> None:
-        """Try entry URLs. account.riotgames.com auto-redirects to the login
-        form (it always requires auth). For other entries we hunt the Sign-In
-        link. Either way we end up on authenticate.riotgames.com."""
-        last_err: Optional[Exception] = None
-        for entry in self.ENTRY_URLS:
-            try:
-                logger.info("[browser] trying entry: %s", entry)
-                await page.goto(entry, wait_until="domcontentloaded", timeout=30000)
-                # Give the page (or any redirect) a beat to settle
-                await page.wait_for_timeout(3000)
-
-                # If Riot auto-redirected us to the login form, we're done.
-                if "authenticate.riotgames.com" in page.url:
-                    logger.info("[browser] auto-redirected to login: %s",
-                                page.url[:120])
-                    return
-
-                # Otherwise try to find and click a Sign In link.
-                clicked = await self._click_sign_in(page)
-                if clicked:
-                    await page.wait_for_url(
-                        re.compile(r"authenticate\.riotgames\.com|"
-                                   r"auth\.riotgames\.com/login"),
-                        timeout=20000,
-                    )
-                    return
-
-                # Dump diagnostic info so we know whether the page even loaded
-                try:
-                    info = await page.evaluate("""() => ({
-                        url: location.href,
-                        title: document.title,
-                        bodyLen: (document.body?.innerText || '').length,
-                        hasCloudflare: !!document.querySelector('[id*="cf-"], [class*="cf-"]'),
-                        linkCount: document.querySelectorAll('a').length,
-                        // Sample of links to debug selector mismatch
-                        sampleHrefs: Array.from(document.querySelectorAll('a'))
-                            .slice(0, 8).map(a => a.href).filter(Boolean),
-                    })""")
-                    logger.warning("[browser] %s: no sign-in found. %s",
-                                   entry, info)
-                except Exception:
-                    pass
-            except Exception as e:
-                last_err = e
-                logger.warning("[browser] entry %s failed: %s — trying next",
-                               entry, str(e)[:120])
-                continue
-
-        raise Exception(
-            f"All entry URLs failed (last error: {last_err}). "
-            f"Last URL on page: {page.url}"
-        )
-
-    async def _click_sign_in(self, page) -> bool:
-        """Find anything that links to the Riot auth flow and click it."""
-        # Wait briefly for React to render header links
+        """Navigate to account.riotgames.com. It always requires login, so
+        Riot auto-redirects to authenticate.* — we just wait for that URL
+        to appear instead of fighting timeouts."""
+        logger.info("[browser] navigating to %s", self.ENTRY_URL)
+        # Use a long timeout so a slow residential proxy doesn't trigger a
+        # premature retry. We're committed to this entry.
         try:
-            await page.wait_for_selector(
-                'a[href*="auth.riotgames.com"], a[href*="login"], '
-                'a[href*="signin"], a[href*="sign-in"]',
-                timeout=8000,
+            await page.goto(self.ENTRY_URL, wait_until="commit", timeout=60000)
+        except Exception as e:
+            logger.warning("[browser] initial goto: %s — still waiting for "
+                           "Riot to redirect", str(e)[:160])
+
+        # Whether goto returned in time or not, wait for the URL to become
+        # an authenticate.* URL (this happens via Riot's 302). Up to 60s.
+        try:
+            await page.wait_for_url(
+                lambda u: "authenticate.riotgames.com" in u,
+                timeout=60000,
             )
-        except Exception:
-            pass
-        # Try multiple strategies
-        selectors = [
-            'a[href*="auth.riotgames.com"]',
-            'a[href*="authenticate.riotgames.com"]',
-            'a[href*="sign-in"]',
-            'a[href*="signin"]',
-            'a:has-text("Sign in")',
-            'a:has-text("Sign In")',
-            'a:has-text("ВОЙТИ")',
-            'a:has-text("Войти")',
-            'button:has-text("Sign in")',
-            'button:has-text("Войти")',
-            'button:has-text("ВОЙТИ")',
-        ]
-        for sel in selectors:
-            try:
-                el = await page.query_selector(sel)
-                if el:
-                    href = await el.get_attribute("href") if "a[" in sel else None
-                    logger.info("[browser] clicking sign-in via %s (href=%s)",
-                                sel, (href or "")[:80])
-                    await el.click()
-                    return True
-            except Exception:
-                continue
-        return False
+        except Exception as e:
+            raise Exception(
+                f"Riot did not redirect to authenticate.riotgames.com within "
+                f"60s. Current URL: {page.url}. "
+                f"Check that RIOT_PROXY can reach account.riotgames.com. "
+                f"Original error: {str(e)[:160]}"
+            )
+        logger.info("[browser] on login form: %s", page.url[:120])
 
     async def _extract_captcha_params(self, page) -> tuple[Optional[str], Optional[str]]:
         """Pull (sitekey, rqdata) from the live DOM."""
