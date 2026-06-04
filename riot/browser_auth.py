@@ -517,7 +517,15 @@ class BrowserAuth:
             logger.warning("[browser] injecting captcha token failed: %s", e)
 
     async def _handle_post_submit_captcha(self, page) -> None:
-        """If Riot showed the captcha challenge after submit, solve it."""
+        """If Riot showed the captcha challenge after submit, solve it.
+        In GUI mode the user can solve visible challenges by hand — we
+        only auto-solve if the captcha is invisible (we can extract sitekey)."""
+        # If browser is visible, defer to manual solving — handled in
+        # _wait_for_logged_in. Auto-solving visible challenges via API
+        # services almost never works.
+        headless = bool(getattr(settings, "RIOT_HEADLESS", True))
+        if not headless:
+            return
         try:
             await page.wait_for_selector(
                 'iframe[src*="hcaptcha"], [data-sitekey]',
@@ -552,52 +560,93 @@ class BrowserAuth:
     async def _wait_for_logged_in(self, page) -> None:
         """Wait until Riot has redirected away from the login form.
 
-        If the visible browser is up and a captcha challenge is showing,
-        wait much longer (up to 3 min) so the user can solve it manually
-        by clicking the images. This is the most reliable fallback when
-        the captcha provider can't handle visible image challenges."""
+        Generously long: the user may need to solve a visible captcha AND
+        type an MFA code from email. Both happen in the visible window.
+        Tolerates 'execution context destroyed' errors during navigation."""
         success_re = re.compile(
             r"(account|auth|www|playvalorant|leagueoflegends)\.?riot.*|"
             r"valorantesports|playvalorant\.com"
         )
         headless = bool(getattr(settings, "RIOT_HEADLESS", True))
-        # 30 s in headless, 180 s if user can see the browser and solve manually
-        total_wait = 30 if headless else 180
+        # In headless: short window (can't help manually anyway).
+        # GUI: long window so captcha + MFA email can both fit.
+        total_wait = 30 if headless else 300  # 5 min for manual flow
         deadline = asyncio.get_event_loop().time() + total_wait
-        warned_manual = False
+        warned_captcha = False
+        warned_mfa = False
+
+        async def _safe_query(selector: str):
+            """query_selector that swallows navigation/context-destroyed errors."""
+            try:
+                return await page.query_selector(selector)
+            except Exception:
+                return None
+
+        async def _safe_url() -> str:
+            try:
+                return page.url
+            except Exception:
+                return ""
+
         while asyncio.get_event_loop().time() < deadline:
-            url = page.url
-            if "authenticate.riotgames.com" not in url and success_re.search(url):
+            url = await _safe_url()
+            if url and "authenticate.riotgames.com" not in url \
+                    and success_re.search(url):
                 return
-            # Surface form-level errors (wrong password etc.) immediately
-            err_el = await page.query_selector(
-                'text=/incorrect|invalid|wrong|неверн|ошибк/i'
-            )
-            if err_el:
-                txt = (await err_el.inner_text())[:200]
-                raise Exception(f"Login form shows error: {txt}")
-            # If a captcha challenge is visible AND we're in GUI mode, prompt
-            # the user to solve it by hand. (In headless we have no choice but
-            # to fail.)
-            has_captcha = await page.query_selector(
+
+            # Surface form-level errors (wrong password etc.) early — but
+            # ONLY if we're still on the username/password form. Once we've
+            # moved past it (e.g. to MFA), these selectors can hit stale text.
+            on_login_form = bool(await _safe_query('input[name="password"]'))
+            if on_login_form:
+                err_el = await _safe_query(
+                    'text=/incorrect|invalid|wrong|неверн|ошибк/i'
+                )
+                if err_el:
+                    try:
+                        txt = (await err_el.inner_text())[:200]
+                    except Exception:
+                        txt = "<error text unreadable>"
+                    raise Exception(f"Login form shows error: {txt}")
+
+            # Captcha challenge?
+            has_captcha = await _safe_query(
                 'iframe[src*="hcaptcha"], iframe[title*="captcha"], '
                 'iframe[title*="challenge"]'
             )
-            if has_captcha and not warned_manual:
+            if has_captcha and not warned_captcha:
                 if headless:
                     raise Exception(
                         "Visible hCaptcha challenge appeared but browser is "
                         "headless. Set RIOT_HEADLESS=False in .env so you can "
-                        "solve the image challenge manually, or top up CapSolver."
+                        "solve it manually."
                     )
                 logger.warning(
-                    "[browser] CAPTCHA CHALLENGE — solve it in the open "
-                    "browser window. Waiting up to %ds for you to finish.",
-                    total_wait,
+                    "[browser] CAPTCHA — solve it in the open browser window."
                 )
-                warned_manual = True
+                warned_captcha = True
+
+            # MFA prompt?
+            has_mfa = await _safe_query(
+                'input[autocomplete="one-time-code"], input[name="code"], '
+                'input[name="multifactor"]'
+            )
+            if has_mfa and not warned_mfa:
+                if headless:
+                    raise Exception(
+                        "MFA code required but browser is headless. Set "
+                        "RIOT_HEADLESS=False so you can enter the code "
+                        "from your email."
+                    )
+                logger.warning(
+                    "[browser] MFA — check your email and enter the code in "
+                    "the open browser window."
+                )
+                warned_mfa = True
+
             await asyncio.sleep(1)
+
         raise Exception(
             f"Login did not redirect away from authenticate.riotgames.com "
-            f"within {total_wait}s. Last URL: {page.url}"
+            f"within {total_wait}s. Last URL: {await _safe_url()}"
         )
