@@ -162,13 +162,17 @@ def _make_session(proxy: Optional[str] = None) -> aiohttp.ClientSession:
     For HTTP proxies the connector is a plain TCPConnector and the proxy URL is
     passed per-request as usual."""
     ssl_ctx = _make_ssl_context()
-    if proxy and proxy.lower().startswith(("socks5://", "socks4://", "socks4a://")):
+    if proxy and proxy.lower().startswith(
+        ("socks5://", "socks4://", "socks4a://", "http://", "https://")
+    ):
+        # ProxyConnector handles BOTH SOCKS and HTTP, and correctly url-decodes
+        # username/password from the proxy URL (aiohttp's per-request proxy=
+        # mishandles creds containing special chars like '-' or '@').
         connector = ProxyConnector.from_url(proxy, ssl=ssl_ctx, force_close=False)
-        # ProxyConnector handles routing — don't pass proxy= on individual requests
         _session_proxy = None
     else:
         connector = aiohttp.TCPConnector(ssl=ssl_ctx, force_close=False)
-        _session_proxy = proxy  # will be passed per-request
+        _session_proxy = proxy  # no proxy at all
 
     session = aiohttp.ClientSession(
         connector=connector,
