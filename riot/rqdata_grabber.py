@@ -115,6 +115,18 @@ async def grab_hcaptcha_params(page_url: str, timeout_seconds: int = 30) -> tupl
                 """)
                 page = await ctx.new_page()
                 page.set_default_timeout(timeout_seconds * 1000)
+                # Warm up Cloudflare: visit riotgames.com first so the
+                # browser gets baseline cookies + a non-bot reputation.
+                # Going straight to authenticate.* from a clean profile
+                # often trips the "automated tools" rule and returns Oops.
+                try:
+                    logger.info("[rqdata] warming up via riotgames.com first")
+                    await page.goto("https://www.riotgames.com/",
+                                    wait_until="domcontentloaded",
+                                    timeout=20000)
+                    await page.wait_for_timeout(2000)
+                except Exception as e:
+                    logger.warning("[rqdata] warmup failed: %s — continuing", e)
                 await page.goto(page_url, wait_until="networkidle")
                 # React app mount + hCaptcha attach takes time — wait for
                 # the captcha iframe OR a visible password field (= form
