@@ -516,8 +516,13 @@ class BrowserAuth:
         if not code:
             logger.warning("[browser] MFA code has no digits")
             return False
-        # Type the code into the MFA field
+        # Type the code via the keyboard — works even if we can't find the
+        # exact CSS selector for the input (Riot's MFA field varies between
+        # accountodactyl/valorant/lol flows). On the MFA page the input is
+        # auto-focused, so keyboard.type lands in the right place.
+        typed = False
         try:
+            # Try direct selectors first (faster + more reliable when they match)
             mfa_selector = (
                 'input[autocomplete="one-time-code"], input[name="code"], '
                 'input[name="multifactor"], input[name="security_code"], '
@@ -525,14 +530,52 @@ class BrowserAuth:
                 'input[inputmode="numeric"][maxlength="6"], '
                 'input[inputmode="numeric"][maxlength="8"], '
                 'input[id*="verification"], input[id*="otp"], '
-                'input[placeholder*="code"]'
+                'input[placeholder*="code"], input[type="tel"]'
             )
-            await page.fill(mfa_selector, code)
+            el = await page.query_selector(mfa_selector)
+            if el:
+                await el.fill(code)
+                try:
+                    await el.press("Enter")
+                except Exception:
+                    pass
+                typed = True
+                logger.info("[browser] MFA code filled via selector")
+        except Exception as e:
+            logger.warning("[browser] MFA selector path failed: %s", e)
+
+        if not typed:
+            # Fallback 1: any visible input on the page
             try:
-                await page.press(mfa_selector, "Enter")
-            except Exception:
-                pass
-            logger.info("[browser] typed MFA code, waiting for redirect…")
+                el = await page.query_selector(
+                    'input:not([type="hidden"]):not([type="submit"])'
+                )
+                if el:
+                    await el.click()  # ensure focus
+                    await el.fill(code)
+                    try:
+                        await el.press("Enter")
+                    except Exception:
+                        pass
+                    typed = True
+                    logger.info("[browser] MFA code filled via generic input")
+            except Exception as e:
+                logger.warning("[browser] generic input path failed: %s", e)
+
+        if not typed:
+            # Fallback 2: just type with the keyboard — whatever has focus
+            # gets it. MFA pages auto-focus the input, so this Just Works.
+            try:
+                await page.keyboard.type(code, delay=80)
+                await page.keyboard.press("Enter")
+                typed = True
+                logger.info("[browser] MFA code typed via keyboard")
+            except Exception as e:
+                logger.warning("[browser] keyboard.type failed: %s", e)
+                return False
+
+        try:
+            logger.info("[browser] waiting for post-MFA redirect…")
             # Wait until we leave authenticate.riotgames.com (i.e. login is
             # complete) — give Riot up to 30s to validate + redirect.
             try:
