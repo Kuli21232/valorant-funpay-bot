@@ -525,26 +525,54 @@ class BrowserAuth:
                 pass
 
     async def _wait_for_logged_in(self, page) -> None:
-        """Wait until Riot has redirected away from the login form."""
-        # Logged-in pages live on these hosts.
+        """Wait until Riot has redirected away from the login form.
+
+        If the visible browser is up and a captcha challenge is showing,
+        wait much longer (up to 3 min) so the user can solve it manually
+        by clicking the images. This is the most reliable fallback when
+        the captcha provider can't handle visible image challenges."""
         success_re = re.compile(
             r"(account|auth|www|playvalorant|leagueoflegends)\.?riot.*|"
             r"valorantesports|playvalorant\.com"
         )
-        deadline = asyncio.get_event_loop().time() + 30
+        headless = bool(getattr(settings, "RIOT_HEADLESS", True))
+        # 30 s in headless, 180 s if user can see the browser and solve manually
+        total_wait = 30 if headless else 180
+        deadline = asyncio.get_event_loop().time() + total_wait
+        warned_manual = False
         while asyncio.get_event_loop().time() < deadline:
             url = page.url
             if "authenticate.riotgames.com" not in url and success_re.search(url):
                 return
-            # If we see an error message on the form, bail early.
+            # Surface form-level errors (wrong password etc.) immediately
             err_el = await page.query_selector(
                 'text=/incorrect|invalid|wrong|неверн|ошибк/i'
             )
             if err_el:
                 txt = (await err_el.inner_text())[:200]
                 raise Exception(f"Login form shows error: {txt}")
+            # If a captcha challenge is visible AND we're in GUI mode, prompt
+            # the user to solve it by hand. (In headless we have no choice but
+            # to fail.)
+            has_captcha = await page.query_selector(
+                'iframe[src*="hcaptcha"], iframe[title*="captcha"], '
+                'iframe[title*="challenge"]'
+            )
+            if has_captcha and not warned_manual:
+                if headless:
+                    raise Exception(
+                        "Visible hCaptcha challenge appeared but browser is "
+                        "headless. Set RIOT_HEADLESS=False in .env so you can "
+                        "solve the image challenge manually, or top up CapSolver."
+                    )
+                logger.warning(
+                    "[browser] CAPTCHA CHALLENGE — solve it in the open "
+                    "browser window. Waiting up to %ds for you to finish.",
+                    total_wait,
+                )
+                warned_manual = True
             await asyncio.sleep(1)
         raise Exception(
             f"Login did not redirect away from authenticate.riotgames.com "
-            f"within 30s. Last URL: {page.url}"
+            f"within {total_wait}s. Last URL: {page.url}"
         )
