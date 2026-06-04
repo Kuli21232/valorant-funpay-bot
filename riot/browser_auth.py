@@ -456,15 +456,11 @@ class BrowserAuth:
             logger.warning("[browser] injecting captcha token failed: %s", e)
 
     async def _handle_post_submit_captcha(self, page) -> None:
-        """If Riot showed the captcha challenge after submit, solve it.
-        In GUI mode the user can solve visible challenges by hand — we
-        only auto-solve if the captcha is invisible (we can extract sitekey)."""
-        # If browser is visible, defer to manual solving — handled in
-        # _wait_for_logged_in. Auto-solving visible challenges via API
-        # services almost never works.
-        headless = bool(getattr(settings, "RIOT_HEADLESS", True))
-        if not headless:
-            return
+        """If Riot showed an invisible hCaptcha challenge after submit, auto-
+        solve it. Runs in BOTH headless and GUI modes — if it succeeds the
+        user never has to touch the captcha; if it fails (e.g. visible
+        image challenge that solver can't handle) we fall through to manual
+        solving in GUI mode."""
         try:
             await page.wait_for_selector(
                 'iframe[src*="hcaptcha"], [data-sitekey]',
@@ -522,17 +518,18 @@ class BrowserAuth:
             return False
         # Type the code into the MFA field
         try:
-            await page.fill(
-                'input[autocomplete="one-time-code"], '
-                'input[name="code"], input[name="multifactor"]',
-                code,
+            mfa_selector = (
+                'input[autocomplete="one-time-code"], input[name="code"], '
+                'input[name="multifactor"], input[name="security_code"], '
+                'input[name="verification_code"], input[name="mfa_code"], '
+                'input[inputmode="numeric"][maxlength="6"], '
+                'input[inputmode="numeric"][maxlength="8"], '
+                'input[id*="verification"], input[id*="otp"], '
+                'input[placeholder*="code"]'
             )
+            await page.fill(mfa_selector, code)
             try:
-                await page.press(
-                    'input[autocomplete="one-time-code"], '
-                    'input[name="code"], input[name="multifactor"]',
-                    "Enter",
-                )
+                await page.press(mfa_selector, "Enter")
             except Exception:
                 pass
             logger.info("[browser] typed MFA code, waiting for redirect…")
@@ -815,11 +812,24 @@ class BrowserAuth:
                 )
                 warned_captcha = True
 
-            # MFA prompt?
+            # MFA prompt? Riot uses several different selectors across the
+            # accountodactyl / valorant / lol flows, so we check all of them.
             has_mfa = await _safe_query(
                 'input[autocomplete="one-time-code"], input[name="code"], '
-                'input[name="multifactor"]'
+                'input[name="multifactor"], input[name="security_code"], '
+                'input[name="verification_code"], input[name="mfa_code"], '
+                'input[inputmode="numeric"][maxlength="6"], '
+                'input[inputmode="numeric"][maxlength="8"], '
+                'input[type="text"][maxlength="6"][autocomplete*="code"], '
+                'input[id*="verification"], input[id*="otp"], '
+                'input[placeholder*="code"], input[placeholder*="ode"]'
             )
+            # Also catch by visible text — e.g. "Enter the 6-digit code"
+            if not has_mfa:
+                has_mfa = await _safe_query(
+                    'text=/verification code|6-digit code|enter the code|'
+                    r'код подтверждения|введите код/i'
+                )
             if has_mfa and not warned_mfa:
                 warned_mfa = True
                 # Ask the user for the code in the terminal — they don't have
